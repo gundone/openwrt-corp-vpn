@@ -176,6 +176,11 @@ install_packages() {
         fi
     fi
 
+    # Перезапуск netifd для регистрации proto handler openconnect
+    # Без этого ifup corp_vpn будет показывать proto=none
+    info "Перезапуск сетевой подсистемы (SSH может на секунду оборваться)..."
+    service network restart 2>/dev/null
+    sleep 3
     service rpcd restart 2>/dev/null
     ok "Пакеты установлены"
 }
@@ -471,7 +476,8 @@ setup_podkop() {
 
     uci set "podkop.$PODKOP_SECTION=section"
     uci set "podkop.$PODKOP_SECTION.connection_type=vpn"
-    uci set "podkop.$PODKOP_SECTION.interface=$IFACE_NAME"
+    # sing-box bind_interface требует имя устройства (vpn-X), а не UCI-интерфейса (X)
+    uci set "podkop.$PODKOP_SECTION.interface=vpn-$IFACE_NAME"
 
     # Domain Resolver (Split DNS через VPN-туннель)
     if [ -n "$CORP_DNS" ]; then
@@ -567,6 +573,10 @@ do_connect() {
             printf "\n"
             printf "${GREEN}[+]${NC} Подключен!\n"
             show_status
+            printf "${BLUE}[i]${NC} Перезапуск Podkop...\n"
+            service podkop restart > /dev/null 2>&1
+            sleep 2
+            printf "${GREEN}[+]${NC} Podkop перезапущен\n"
             return 0
         fi
         printf "."
@@ -641,10 +651,6 @@ first_connect() {
         return 0
     fi
 
-    info "Перезапуск Podkop..."
-    service podkop restart
-    sleep 3
-
     info "Подключение к $VPN_SERVER..."
     warn "Подтвердите 2FA на телефоне!"
     echo ""
@@ -665,6 +671,13 @@ first_connect() {
             vpn_ip=$(ifstatus "$IFACE_NAME" 2>/dev/null | \
                 jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
             info "VPN IP: ${vpn_ip:-N/A}"
+
+            # Перезапуск Podkop ПОСЛЕ подключения VPN,
+            # чтобы sing-box увидел интерфейс vpn-corp_vpn
+            info "Перезапуск Podkop (чтобы увидел VPN-интерфейс)..."
+            service podkop restart
+            sleep 3
+            ok "Podkop перезапущен"
             return 0
         fi
         printf "."
