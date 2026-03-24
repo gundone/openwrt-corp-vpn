@@ -62,9 +62,9 @@ step() {
 ask() {
     local prompt="$1" default="$2" answer
     if [ -n "$default" ]; then
-        printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default"
+        printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default" >&2
     else
-        printf "${BOLD}%s${NC}: " "$prompt"
+        printf "${BOLD}%s${NC}: " "$prompt" >&2
     fi
     read answer
     if [ -z "$answer" ] && [ -n "$default" ]; then
@@ -76,11 +76,11 @@ ask() {
 
 ask_password() {
     local prompt="$1" answer
-    printf "${BOLD}%s${NC}: " "$prompt"
+    printf "${BOLD}%s${NC}: " "$prompt" >&2
     stty -echo 2>/dev/null
     read answer
     stty echo 2>/dev/null
-    printf "\n"
+    printf "\n" >&2
     echo "$answer"
 }
 
