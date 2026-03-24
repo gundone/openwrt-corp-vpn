@@ -186,7 +186,14 @@ install_packages() {
 gather_vpn_info() {
     step "2" "Параметры корпоративного VPN"
 
-    VPN_SERVER=$(ask "URL VPN-сервера (например https://vpn.company.com)")
+    info "Все данные можно взять из AnyConnect/OpenConnect клиента на ПК."
+    info "Откройте клиент и посмотрите, какие параметры используются при подключении."
+    echo ""
+
+    # --- VPN Server ---
+    info "Адрес сервера — строка подключения в AnyConnect клиенте."
+    info "Примеры: vpn.company.com, https://vpn.company.com/corp"
+    VPN_SERVER=$(ask "URL VPN-сервера")
 
     # Добавить https:// если не указан протокол
     case "$VPN_SERVER" in
@@ -194,17 +201,30 @@ gather_vpn_info() {
         *) VPN_SERVER="https://$VPN_SERVER" ;;
     esac
 
-    VPN_USER=$(ask "Имя пользователя (логин)")
+    # --- Username ---
+    echo ""
+    info "Логин — тот же, что вводите в AnyConnect при подключении."
+    VPN_USER=$(ask "Имя пользователя")
+
+    # --- Password ---
+    echo ""
+    info "Пароль — корпоративный пароль. Ввод скрыт, символы не отображаются."
     VPN_PASS=$(ask_password "Пароль")
 
+    # --- Group ---
+    echo ""
+    info "GROUP — некоторые серверы показывают выпадающий список перед подключением."
+    info "Если в AnyConnect нет выбора группы — ответьте 'n'."
     if ask_yesno "Сервер спрашивает GROUP при подключении?" "n"; then
         VPN_GROUP=$(ask "Название группы")
     fi
 
+    # --- 2FA ---
     echo ""
     printf "${BOLD}Тип двухфакторной аутентификации:${NC}\n"
-    printf "  1) Push на телефон (Duo, MS Authenticator)\n"
-    printf "  2) TOTP-код (Google Authenticator)\n"
+    info "Выберите способ, которым вы обычно подтверждаете вход в VPN."
+    printf "  1) Push на телефон (Duo, MS Authenticator, Okta Verify)\n"
+    printf "  2) TOTP-код из приложения (Google Authenticator и т.д.)\n"
     printf "  3) SMS-код\n"
     printf "  4) Нет 2FA / не уверен\n"
     local tfa_choice
@@ -221,13 +241,16 @@ gather_vpn_info() {
         4) VPN_PASS2="" ;;
     esac
 
+    # --- Server hash ---
     echo ""
+    info "Хэш сертификата — уникальный отпечаток VPN-сервера для безопасности."
+    info "Если не знаете — ответьте 'n'. Скрипт получит его автоматически на шаге тестирования."
     if ask_yesno "Знаете SHA256-хэш сертификата VPN-сервера?" "n"; then
         VPN_SERVERHASH=$(ask "Хэш (формат: pin-sha256:... или sha256:...)")
     fi
 
     echo ""
-    info "Параметры сохранены."
+    ok "Параметры сохранены."
 }
 
 # ============================================================
