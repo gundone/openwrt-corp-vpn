@@ -16,20 +16,31 @@
 
 ## Быстрый старт
 
-```bash
-# Скопировать на роутер
-scp setup-corp-vpn.sh root@ROUTER:/tmp/
+### Вариант 1: Скачать и запустить прямо на роутере
 
+```bash
 # SSH на роутер
 ssh root@ROUTER
 
-# Исправить переводы строк (если копировали с Windows)
-sed -i 's/\r$//' /tmp/setup-corp-vpn.sh
-
-# Запустить установку
+# Скачать скрипт с GitHub и запустить
+wget -O /tmp/setup-corp-vpn.sh https://raw.githubusercontent.com/gundone/openwrt-corp-vpn/main/setup-corp-vpn.sh
 sh /tmp/setup-corp-vpn.sh
+```
 
-# Или откат всех изменений
+### Вариант 2: Скопировать с компьютера
+
+```bash
+# С ПК (Windows/macOS/Linux)
+scp setup-corp-vpn.sh root@ROUTER:/tmp/
+
+ssh root@ROUTER
+sed -i 's/\r$//' /tmp/setup-corp-vpn.sh   # исправить переводы строк, если копировали с Windows
+sh /tmp/setup-corp-vpn.sh
+```
+
+### Откат всех изменений
+
+```bash
 sh /tmp/setup-corp-vpn.sh uninstall
 ```
 
