@@ -66,7 +66,7 @@ ask() {
     else
         printf "${BOLD}%s${NC}: " "$prompt" >&2
     fi
-    read answer
+    read -r answer
     if [ -z "$answer" ] && [ -n "$default" ]; then
         echo "$default"
     else
@@ -78,7 +78,7 @@ ask_password() {
     local prompt="$1" answer
     printf "${BOLD}%s${NC}: " "$prompt" >&2
     stty -echo 2>/dev/null
-    read answer
+    read -r answer
     stty echo 2>/dev/null
     printf "\n" >&2
     echo "$answer"
@@ -91,7 +91,7 @@ ask_yesno() {
     else
         printf "${BOLD}%s${NC} [y/N]: " "$prompt"
     fi
-    read answer
+    read -r answer
     case "$answer" in
         [Yy]*) return 0 ;;
         [Nn]*) return 1 ;;
