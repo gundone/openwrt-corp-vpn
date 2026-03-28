@@ -1739,6 +1739,113 @@ show_summary() {
 }
 
 # ============================================================
+# Обновление на текущих параметрах
+# ============================================================
+read_existing_config() {
+    info "Чтение текущей конфигурации..."
+
+    if ! uci -q get "network.$IFACE_NAME.uri" > /dev/null 2>&1; then
+        err "Интерфейс $IFACE_NAME не найден. Выполните полную установку:"
+        err "  sh $0 install"
+        exit 1
+    fi
+
+    VPN_SERVER=$(uci -q get "network.$IFACE_NAME.uri")
+    VPN_USER=$(uci -q get "network.$IFACE_NAME.username")
+    ok "VPN-сервер: $VPN_SERVER"
+    ok "Пользователь: ${VPN_USER:-N/A}"
+
+    # Серверы: из UCI corpvpn (новый формат) или из старого скрипта
+    UCI_CONFIG_EXISTS=0
+    if uci -q show "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.servers" > /dev/null 2>&1; then
+        UCI_CONFIG_EXISTS=1
+        ok "UCI-конфиг найден — серверы сохранены"
+    elif [ -f "$DAILY_SCRIPT" ] && grep -q "^VPN_SERVERS=" "$DAILY_SCRIPT"; then
+        info "Миграция серверов из старого скрипта..."
+        old_servers=$(grep "^VPN_SERVERS=" "$DAILY_SCRIPT" | sed 's/^VPN_SERVERS="//;s/"$//')
+        first=1
+        VPN_SERVERS_EXTRA=""
+        for s in $old_servers; do
+            if [ $first -eq 1 ]; then
+                VPN_SERVER="$s"
+                first=0
+            else
+                VPN_SERVERS_EXTRA="${VPN_SERVERS_EXTRA:+$VPN_SERVERS_EXTRA }$s"
+            fi
+        done
+        ok "Серверы из старого скрипта: $VPN_SERVER $VPN_SERVERS_EXTRA"
+    else
+        VPN_SERVERS_EXTRA=""
+        info "Один сервер: $VPN_SERVER"
+    fi
+
+    # Автоотключение: из UCI или из cron
+    AUTO_DISCONNECT_TIME=$(uci -q get "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.disconnect_time")
+    if [ -z "$AUTO_DISCONNECT_TIME" ] && [ -f /etc/crontabs/root ]; then
+        cron_line=$(grep "corpvpn-auto-disconnect" /etc/crontabs/root 2>/dev/null | head -1)
+        if [ -n "$cron_line" ]; then
+            cron_min=$(echo "$cron_line" | awk '{print $1}')
+            cron_hour=$(echo "$cron_line" | awk '{print $2}')
+            AUTO_DISCONNECT_TIME=$(printf "%02d:%02d" "$cron_hour" "$cron_min")
+        fi
+    fi
+    if [ -n "$AUTO_DISCONNECT_TIME" ]; then
+        ok "Автоотключение: $AUTO_DISCONNECT_TIME"
+    fi
+
+    echo ""
+}
+
+main_upgrade() {
+    printf "${BOLD}${CYAN}"
+    printf "╔══════════════════════════════════════════╗\n"
+    printf "║  OpenConnect + Podkop — ОБНОВЛЕНИЕ       ║\n"
+    printf "║  Корпоративный VPN на OpenWrt            ║\n"
+    printf "╚══════════════════════════════════════════╝\n"
+    printf "${NC}\n"
+
+    info "Обновление скриптов и LuCI без изменения параметров VPN."
+    echo ""
+
+    read_existing_config
+
+    # UCI-конфиг: создать если отсутствует, иначе сохранить
+    if [ "$UCI_CONFIG_EXISTS" = "0" ]; then
+        create_uci_config
+    else
+        ok "UCI-конфиг сохранён без изменений"
+    fi
+
+    create_daily_script
+
+    # Синхронизация автоотключения (UCI + cron)
+    if [ -n "$AUTO_DISCONNECT_TIME" ]; then
+        "$DAILY_SCRIPT" schedule "$AUTO_DISCONNECT_TIME" > /dev/null 2>&1
+        ok "Расписание синхронизировано: $AUTO_DISCONNECT_TIME"
+    fi
+
+    deploy_luci_app
+
+    printf "\n${BOLD}${GREEN}══════════════════════════════════════${NC}\n"
+    printf "${BOLD}${GREEN}  Обновление завершено!${NC}\n"
+    printf "${BOLD}${GREEN}══════════════════════════════════════${NC}\n\n"
+
+    printf "${BOLD}Обновлено:${NC}\n"
+    printf "  /usr/bin/corpvpn              Утилита командной строки\n"
+    if [ "$UCI_CONFIG_EXISTS" = "0" ]; then
+        printf "  /etc/config/corpvpn           UCI-конфиг (создан)\n"
+    fi
+    printf "  Services → Corp VPN           LuCI-приложение\n"
+    echo ""
+
+    printf "${BOLD}Не изменено:${NC}\n"
+    printf "  Сетевой интерфейс %s\n" "$IFACE_NAME"
+    printf "  Секции Podkop\n"
+    printf "  Патч vpnc-script\n"
+    echo ""
+}
+
+# ============================================================
 # main
 # ============================================================
 main_install() {
@@ -1770,12 +1877,14 @@ main_install() {
 show_usage() {
     printf "${BOLD}Использование:${NC}\n"
     printf "  sh %s              Установка (интерактивный мастер)\n" "$0"
+    printf "  sh %s upgrade      Обновить скрипты на текущих параметрах\n" "$0"
     printf "  sh %s uninstall    Откат всех изменений\n" "$0"
     printf "  sh %s help         Эта справка\n" "$0"
 }
 
 case "${1:-install}" in
     install|setup)     main_install ;;
+    upgrade|update)    main_upgrade ;;
     uninstall|remove)  uninstall ;;
     help|--help|-h)    show_usage ;;
     *)
