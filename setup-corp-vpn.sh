@@ -37,6 +37,7 @@ CORP_DOMAINS=""
 PROXY_SERVER=""
 PROXY_PORT=""
 PROXY_DOMAINS=""
+AUTO_DISCONNECT_TIME=""
 
 # ============================================================
 # Цвета
@@ -614,6 +615,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
+CRON_TAG="corpvpn-auto-disconnect"
+CONNECT_TIMEOUT=120
 
 server_count() {
     local count=0
@@ -639,6 +642,16 @@ show_status() {
         printf "${GREEN}[VPN]${NC} Подключен (IP: %s, сервер: %s)\n" "${ip:-N/A}" "${uri:-N/A}"
     else
         printf "${RED}[VPN]${NC} Отключен\n"
+    fi
+    if [ -f /etc/crontabs/root ]; then
+        local sched
+        sched=$(grep "$CRON_TAG" /etc/crontabs/root 2>/dev/null | head -1)
+        if [ -n "$sched" ]; then
+            local cron_min cron_hour
+            cron_min=$(echo "$sched" | awk '{print $1}')
+            cron_hour=$(echo "$sched" | awk '{print $2}')
+            printf "${BLUE}[i]${NC} Автоотключение: %02d:%02d\n" "$cron_hour" "$cron_min"
+        fi
     fi
 }
 
@@ -728,11 +741,10 @@ do_connect() {
     printf "${YELLOW}[!]${NC} Подтвердите 2FA на телефоне!\n"
     ifup "$IFACE"
 
-    # Ждём подключения (макс. 60 сек)
+    # Ждём подключения (макс. CONNECT_TIMEOUT сек ≈ 2 попытки 2FA)
     local i=0
-    local max_wait=60
-    printf "${BLUE}[i]${NC} Ожидание "
-    while [ $i -lt $max_wait ]; do
+    printf "${BLUE}[i]${NC} Ожидание (макс. %s сек) " "$CONNECT_TIMEOUT"
+    while [ $i -lt $CONNECT_TIMEOUT ]; do
         up=$(get_status)
         if [ "$up" = "true" ]; then
             printf "\n"
@@ -750,8 +762,10 @@ do_connect() {
     done
 
     printf "\n"
-    printf "${RED}[-]${NC} Не удалось подключиться за %s сек.\n" "$max_wait"
-    printf "${YELLOW}[!]${NC} Проверьте: logread | grep openconnect\n"
+    printf "${RED}[-]${NC} Не удалось подключиться за %s сек.\n" "$CONNECT_TIMEOUT"
+    printf "${YELLOW}[!]${NC} Отменяю попытку подключения...\n"
+    ifdown "$IFACE"
+    printf "${BLUE}[i]${NC} Проверьте: logread | grep openconnect\n"
     return 1
 }
 
@@ -834,17 +848,48 @@ do_delhost() {
     show_servers
 }
 
+do_schedule() {
+    local time="${1:-21:00}"
+    case "$time" in
+        [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+        *)
+            printf "${RED}[-]${NC} Неверный формат: %s (ожидается HH:MM, 00:00–23:59)\n" "$time"
+            return 1
+            ;;
+    esac
+    local hour="${time%%:*}"
+    local minute="${time##*:}"
+    if [ -f /etc/crontabs/root ]; then
+        sed -i "/$CRON_TAG/d" /etc/crontabs/root
+    fi
+    echo "$minute $hour * * * /usr/bin/corpvpn disconnect  # $CRON_TAG" >> /etc/crontabs/root
+    /etc/init.d/cron restart 2>/dev/null
+    printf "${GREEN}[+]${NC} Автоотключение: каждый день в %s\n" "$time"
+}
+
+do_unschedule() {
+    if [ -f /etc/crontabs/root ] && grep -q "$CRON_TAG" /etc/crontabs/root; then
+        sed -i "/$CRON_TAG/d" /etc/crontabs/root
+        /etc/init.d/cron restart 2>/dev/null
+        printf "${GREEN}[+]${NC} Автоотключение отменено\n"
+    else
+        printf "${YELLOW}[!]${NC} Автоотключение не настроено\n"
+    fi
+}
+
 show_help() {
     printf "${BOLD}Использование:${NC} corpvpn [команда]\n\n"
-    printf "  ${BOLD}connect${NC} [N|host]  Подключиться (нужно подтвердить 2FA)\n"
-    printf "  ${BOLD}disconnect${NC}        Отключиться\n"
-    printf "  ${BOLD}status${NC}            Показать статус\n"
-    printf "  ${BOLD}restart${NC} [N|host]  Переподключиться\n"
-    printf "  ${BOLD}servers${NC}           Показать список серверов\n"
-    printf "  ${BOLD}addhost${NC} [host]    Добавить сервер\n"
-    printf "  ${BOLD}delhost${NC} [N]       Удалить сервер\n"
-    printf "  ${BOLD}logs${NC}              Показать логи OpenConnect\n"
-    printf "  ${BOLD}help${NC}              Эта справка\n"
+    printf "  ${BOLD}connect${NC} [N|host]    Подключиться (нужно подтвердить 2FA)\n"
+    printf "  ${BOLD}disconnect${NC}          Отключиться\n"
+    printf "  ${BOLD}status${NC}              Показать статус\n"
+    printf "  ${BOLD}restart${NC} [N|host]    Переподключиться\n"
+    printf "  ${BOLD}servers${NC}             Показать список серверов\n"
+    printf "  ${BOLD}addhost${NC} [host]      Добавить сервер\n"
+    printf "  ${BOLD}delhost${NC} [N]         Удалить сервер\n"
+    printf "  ${BOLD}schedule${NC} [HH:MM]   Автоотключение по расписанию (по умолч. 21:00)\n"
+    printf "  ${BOLD}unschedule${NC}          Отменить автоотключение\n"
+    printf "  ${BOLD}logs${NC}                Показать логи OpenConnect\n"
+    printf "  ${BOLD}help${NC}                Эта справка\n"
 }
 
 case "${1:-status}" in
@@ -855,6 +900,8 @@ case "${1:-status}" in
     servers|srv)         show_servers ;;
     addhost)             do_addhost "$2" ;;
     delhost|rmhost)      do_delhost "$2" ;;
+    schedule|sched)      do_schedule "$2" ;;
+    unschedule|unsched)  do_unschedule ;;
     logs|log)            logread | grep -i openconnect | tail -30 ;;
     help|--help|-h)      show_help ;;
     *)
@@ -877,7 +924,48 @@ SCRIPT_EOF
     info "  corpvpn addhost <host>   — добавить сервер"
     info "  corpvpn delhost <N>      — удалить сервер"
     info "  corpvpn restart          — переподключиться"
+    info "  corpvpn schedule [HH:MM] — автоотключение (по умолч. 21:00)"
+    info "  corpvpn unschedule       — отменить автоотключение"
     info "  corpvpn logs             — логи"
+}
+
+# ============================================================
+# Шаг 7b: Автоотключение по расписанию
+# ============================================================
+setup_auto_disconnect() {
+    echo ""
+    info "Можно настроить автоматическое отключение VPN по расписанию."
+    info "Например, каждый день в 21:00 — чтобы VPN не оставался на ночь."
+    echo ""
+
+    if ! ask_yesno "Настроить автоотключение VPN?" "y"; then
+        return 0
+    fi
+
+    AUTO_DISCONNECT_TIME=$(ask "Время отключения (HH:MM)" "21:00")
+
+    case "$AUTO_DISCONNECT_TIME" in
+        [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+        *)
+            warn "Неверный формат времени. Автоотключение не настроено."
+            warn "Можно настроить позже: corpvpn schedule 21:00"
+            AUTO_DISCONNECT_TIME=""
+            return 0
+            ;;
+    esac
+
+    local hour="${AUTO_DISCONNECT_TIME%%:*}"
+    local minute="${AUTO_DISCONNECT_TIME##*:}"
+
+    # Удалить существующую запись, если есть
+    if [ -f /etc/crontabs/root ]; then
+        sed -i "/corpvpn-auto-disconnect/d" /etc/crontabs/root
+    fi
+
+    echo "$minute $hour * * * /usr/bin/corpvpn disconnect  # corpvpn-auto-disconnect" >> /etc/crontabs/root
+    /etc/init.d/cron restart 2>/dev/null
+
+    ok "Автоотключение: каждый день в $AUTO_DISCONNECT_TIME"
 }
 
 # ============================================================
@@ -896,10 +984,10 @@ first_connect() {
     echo ""
     ifup "$IFACE_NAME"
 
-    # Ожидание подключения
+    # Ожидание подключения (макс. 120 сек ≈ 2 попытки 2FA)
     local i=0
-    local max_wait=90
-    printf "Ожидание "
+    local max_wait=120
+    printf "Ожидание (макс. %sс) " "$max_wait"
     while [ $i -lt $max_wait ]; do
         local up
         up=$(ifstatus "$IFACE_NAME" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
@@ -927,8 +1015,9 @@ first_connect() {
 
     printf "\n"
     err "Не удалось подключиться за ${max_wait}с."
+    warn "Отменяю попытку подключения..."
+    ifdown "$IFACE_NAME" 2>/dev/null
     warn "Проверьте логи: logread | grep openconnect"
-    warn "Возможно, 2FA не была подтверждена вовремя."
 }
 
 # ============================================================
@@ -1020,7 +1109,8 @@ uninstall() {
     printf "  3. Удаление секций '%s' и '%s' из /etc/config/podkop\n" "$PODKOP_SECTION" "$PODKOP_PROXY_SECTION"
     printf "  4. Восстановление vpnc-script из бэкапа\n"
     printf "  5. Удаление скрипта %s\n" "$DAILY_SCRIPT"
-    printf "  6. (опционально) Удаление пакетов openconnect\n"
+    printf "  6. Удаление автоотключения из cron\n"
+    printf "  7. (опционально) Удаление пакетов openconnect\n"
     echo ""
 
     if ! ask_yesno "Продолжить откат?" "n"; then
@@ -1034,6 +1124,7 @@ uninstall() {
     uninstall_podkop
     uninstall_vpnc_patch
     uninstall_daily_script
+    uninstall_cron
     uninstall_packages
     uninstall_restart_services
     uninstall_summary
@@ -1120,6 +1211,17 @@ uninstall_daily_script() {
     fi
 }
 
+uninstall_cron() {
+    info "Удаление автоотключения из cron..."
+    if [ -f /etc/crontabs/root ] && grep -q "corpvpn-auto-disconnect" /etc/crontabs/root; then
+        sed -i "/corpvpn-auto-disconnect/d" /etc/crontabs/root
+        /etc/init.d/cron restart 2>/dev/null
+        ok "Автоотключение удалено из cron"
+    else
+        ok "Автоотключение не было настроено"
+    fi
+}
+
 uninstall_packages() {
     echo ""
     if ! ask_yesno "Удалить пакеты openconnect и luci-proto-openconnect?" "n"; then
@@ -1175,13 +1277,22 @@ show_summary() {
     printf "${BOLD}${GREEN}══════════════════════════════════════${NC}\n\n"
 
     printf "${BOLD}Ежедневное использование:${NC}\n"
-    printf "  corpvpn connect       Подключиться (+ 2FA)\n"
-    printf "  corpvpn disconnect    Отключиться\n"
-    printf "  corpvpn status        Проверить статус\n"
-    printf "  corpvpn servers       Список серверов\n"
-    printf "  corpvpn addhost       Добавить сервер\n"
-    printf "  corpvpn delhost       Удалить сервер\n"
-    printf "  corpvpn logs          Посмотреть логи\n"
+    printf "  corpvpn connect        Подключиться (+ 2FA)\n"
+    printf "  corpvpn disconnect     Отключиться\n"
+    printf "  corpvpn status         Проверить статус\n"
+    printf "  corpvpn servers        Список серверов\n"
+    printf "  corpvpn addhost        Добавить сервер\n"
+    printf "  corpvpn delhost        Удалить сервер\n"
+    printf "  corpvpn schedule       Автоотключение (по умолч. 21:00)\n"
+    printf "  corpvpn unschedule     Отменить автоотключение\n"
+    printf "  corpvpn logs           Посмотреть логи\n"
+    echo ""
+
+    if [ -n "$AUTO_DISCONNECT_TIME" ]; then
+        printf "${BOLD}Автоотключение:${NC} каждый день в %s\n" "$AUTO_DISCONNECT_TIME"
+        printf "  Изменить:  corpvpn schedule 22:00\n"
+        printf "  Отменить:  corpvpn unschedule\n"
+    fi
     echo ""
 
     printf "${BOLD}Что проверить в LuCI:${NC}\n"
@@ -1222,6 +1333,7 @@ main_install() {
     gather_proxy_info
     setup_podkop_proxy
     create_daily_script
+    setup_auto_disconnect
     first_connect
     verify
     show_summary
