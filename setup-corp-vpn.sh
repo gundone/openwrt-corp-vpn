@@ -30,6 +30,8 @@ RPCD_SCRIPT="/usr/libexec/rpcd/luci.corpvpn"
 LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
 LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
 LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
+CORPVPN_VERSION="1.0.0"
+CORPVPN_REPO="gundone/corpvpn-for-podkop"
 
 # Собранные данные (заполняются в процессе)
 VPN_SERVER=""
@@ -605,8 +607,9 @@ create_uci_config() {
         uci add_list "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.servers=$s"
     done
 
+    uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.version=$CORPVPN_VERSION"
     uci commit "$CORPVPN_UCI"
-    ok "UCI-конфиг создан"
+    ok "UCI-конфиг создан (v$CORPVPN_VERSION)"
 }
 
 # ============================================================
@@ -1060,14 +1063,14 @@ MENU_EOF
         "description": "Grant access to Corp VPN management",
         "read": {
             "ubus": {
-                "luci.corpvpn": ["getStatus", "getRoutes"],
+                "luci.corpvpn": ["getStatus", "getRoutes", "checkVersion", "getLogs"],
                 "uci": ["corpvpn", "network"]
             },
             "uci": ["corpvpn", "network"]
         },
         "write": {
             "ubus": {
-                "luci.corpvpn": ["connect", "disconnect", "restartPodkop", "setSchedule", "removeSchedule"],
+                "luci.corpvpn": ["connect", "disconnect", "restartPodkop", "setSchedule", "removeSchedule", "doUpgrade"],
                 "uci": ["corpvpn", "network"]
             },
             "uci": ["corpvpn", "network"]
@@ -1086,7 +1089,7 @@ ACL_EOF
 
 case "$1" in
     list)
-        echo '{"getStatus":{},"getRoutes":{},"connect":{"server":"str"},"disconnect":{},"restartPodkop":{},"setSchedule":{"time":"str"},"removeSchedule":{}}'
+        echo '{"getStatus":{},"getRoutes":{},"checkVersion":{},"getLogs":{},"doUpgrade":{},"connect":{"server":"str"},"disconnect":{},"restartPodkop":{},"setSchedule":{"time":"str"},"removeSchedule":{}}'
         ;;
     call)
         case "$2" in
@@ -1124,6 +1127,32 @@ case "$1" in
                 done < "$_tmpfile"
                 json_close_array
                 rm -f "$_tmpfile"
+                json_dump
+                ;;
+            checkVersion)
+                _current=$(uci -q get corpvpn.main.version)
+                _latest=$(wget -qO- "https://raw.githubusercontent.com/gundone/corpvpn-for-podkop/main/VERSION" 2>/dev/null | head -1 | tr -d '[:space:]')
+                json_init
+                json_add_string "current" "${_current:-unknown}"
+                json_add_string "latest" "${_latest:-unknown}"
+                json_dump
+                ;;
+            getLogs)
+                _tmpfile="/tmp/.corpvpn_logs"
+                logread 2>/dev/null | grep -i openconnect | tail -50 > "$_tmpfile"
+                json_init
+                json_add_array "lines"
+                while IFS= read -r _line; do
+                    json_add_string "" "$_line"
+                done < "$_tmpfile"
+                json_close_array
+                rm -f "$_tmpfile"
+                json_dump
+                ;;
+            doUpgrade)
+                (wget -qO /tmp/setup-corp-vpn.sh "https://raw.githubusercontent.com/gundone/corpvpn-for-podkop/main/setup-corp-vpn.sh" 2>/dev/null && sh /tmp/setup-corp-vpn.sh upgrade > /tmp/corpvpn-upgrade.log 2>&1; rm -f /tmp/setup-corp-vpn.sh) &
+                json_init
+                json_add_boolean "ok" 1
                 json_dump
                 ;;
             connect)
@@ -1231,6 +1260,21 @@ var callSetSchedule = rpc.declare({
 var callRemoveSchedule = rpc.declare({
     object: 'luci.corpvpn',
     method: 'removeSchedule'
+});
+
+var callCheckVersion = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'checkVersion'
+});
+
+var callGetLogs = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'getLogs'
+});
+
+var callDoUpgrade = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'doUpgrade'
 });
 
 function statusColor(s) {
@@ -1449,13 +1493,102 @@ return view.extend({
         /* ── Автообновление статуса ── */
         poll.add(L.bind(this.pollStatus, this), 5);
 
+        /* ══════════ Вкладка: Диагностика ══════════ */
+
+        /* ── Версия ── */
+        var versionInfo = E('div', { id: 'version-info' }, [
+            E('p', { style: 'color:#999' }, 'Загрузка...')
+        ]);
+
+        var versionBox = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, 'Версия'),
+            versionInfo
+        ]);
+
+        callCheckVersion().then(function(v) {
+            var el = document.getElementById('version-info');
+            if (!el || !v) return;
+            var cur = v.current || 'unknown';
+            var lat = v.latest || 'unknown';
+            var needsUpdate = (cur !== lat && lat !== 'unknown' && cur !== 'unknown');
+            var items = [
+                E('div', { style: 'margin:4px 0' }, [
+                    E('strong', {}, 'Установлена: '), E('span', {}, cur)
+                ]),
+                E('div', { style: 'margin:4px 0' }, [
+                    E('strong', {}, 'Доступна: '),
+                    E('span', { style: needsUpdate ? 'color:#ff9800;font-weight:bold' : '' }, lat)
+                ])
+            ];
+            if (needsUpdate) {
+                items.push(E('button', {
+                    'class': 'cbi-button cbi-button-apply',
+                    style: 'margin-top:8px',
+                    click: ui.createHandlerFn(self, function() {
+                        if (!confirm('Обновить corpvpn до версии ' + lat + '?')) return;
+                        return callDoUpgrade().then(function() {
+                            ui.addNotification(null, E('p', 'Обновление запущено в фоне. Страница обновится через 30 секунд...'), 'info');
+                            setTimeout(function() { location.reload(); }, 30000);
+                        });
+                    })
+                }, 'Обновить до ' + lat));
+            } else if (cur !== 'unknown') {
+                items.push(E('p', { style: 'color:#4caf50;margin-top:4px' }, 'Актуальная версия'));
+            }
+            dom.content(el, items);
+        });
+
+        /* ── Логи ── */
+        var logsBox = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, 'Логи OpenConnect'),
+            E('button', {
+                'class': 'cbi-button cbi-button-action',
+                click: ui.createHandlerFn(this, function() {
+                    return callGetLogs().then(function(data) {
+                        var el = document.getElementById('log-output');
+                        if (!el || !data) return;
+                        var lines = data.lines || [];
+                        if (lines.length === 0) {
+                            dom.content(el, E('p', { style: 'color:#999' }, 'Логи пусты'));
+                        } else {
+                            dom.content(el, E('pre', {
+                                style: 'max-height:400px;overflow:auto;background:#1a1a2e;color:#e0e0e0;padding:10px;border-radius:4px;font-size:12px;line-height:1.4;white-space:pre-wrap;word-break:break-all'
+                            }, lines.join('\n')));
+                        }
+                    });
+                })
+            }, 'Загрузить логи'),
+            E('div', { id: 'log-output', style: 'margin-top:8px' })
+        ]);
+
+        /* ══════════ Вкладки ══════════ */
+        var contentMain = E('div', {}, [statusBox, connBox, serversBox, routesBox, scheduleBox]);
+        var contentDiag = E('div', { style: 'display:none' }, [versionBox, logsBox]);
+
+        var tabMainBtn = E('li', { 'class': 'cbi-tab' }, E('a', { href: '#' }, 'Управление'));
+        var tabDiagBtn = E('li', { 'class': 'cbi-tab-disabled' }, E('a', { href: '#' }, 'Диагностика'));
+
+        tabMainBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            contentMain.style.display = '';
+            contentDiag.style.display = 'none';
+            tabMainBtn.className = 'cbi-tab';
+            tabDiagBtn.className = 'cbi-tab-disabled';
+        });
+
+        tabDiagBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            contentMain.style.display = 'none';
+            contentDiag.style.display = '';
+            tabMainBtn.className = 'cbi-tab-disabled';
+            tabDiagBtn.className = 'cbi-tab';
+        });
+
         return E('div', {}, [
             E('h2', {}, 'Corp VPN'),
-            statusBox,
-            connBox,
-            serversBox,
-            routesBox,
-            scheduleBox
+            E('ul', { 'class': 'cbi-tabmenu' }, [tabMainBtn, tabDiagBtn]),
+            contentMain,
+            contentDiag
         ]);
     }
 });
@@ -1929,8 +2062,12 @@ main_upgrade() {
 
     deploy_luci_app
 
+    # Обновить версию в UCI
+    uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.version=$CORPVPN_VERSION"
+    uci commit "$CORPVPN_UCI"
+
     printf "\n${BOLD}${GREEN}══════════════════════════════════════${NC}\n"
-    printf "${BOLD}${GREEN}  Обновление завершено!${NC}\n"
+    printf "${BOLD}${GREEN}  Обновление завершено (v$CORPVPN_VERSION)!${NC}\n"
     printf "${BOLD}${GREEN}══════════════════════════════════════${NC}\n\n"
 
     printf "${BOLD}Обновлено:${NC}\n"
