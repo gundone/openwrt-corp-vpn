@@ -743,6 +743,22 @@ switch_server() {
     fi
 }
 
+sync_routes_to_podkop() {
+    local routes=""
+    local route
+    for route in $(ip route 2>/dev/null | grep "dev vpn-$IFACE" | awk '{print $1}'); do
+        routes="${routes:+$routes }$route"
+    done
+    if [ -n "$routes" ]; then
+        uci set "podkop.corp.user_subnet_list_type=text"
+        uci set "podkop.corp.user_subnets_text=$routes"
+        uci commit podkop
+        local count
+        count=$(echo "$routes" | wc -w)
+        printf "${BLUE}[i]${NC} Split-include → Podkop: %s подсетей\n" "$count"
+    fi
+}
+
 do_connect() {
     local requested="$1"
 
@@ -788,6 +804,7 @@ do_connect() {
             printf "\n"
             printf "${GREEN}[+]${NC} Подключен!\n"
             show_status
+            sync_routes_to_podkop
             printf "${BLUE}[i]${NC} Перезапуск Podkop...\n"
             service podkop restart > /dev/null 2>&1
             sleep 2
@@ -1129,6 +1146,16 @@ case "$1" in
                 json_dump
                 ;;
             restartPodkop)
+                # Sync split-include routes to Podkop before restart
+                _routes=""
+                for _r in $(ip route 2>/dev/null | grep "dev vpn-corp_vpn" | awk '{print $1}'); do
+                    _routes="${_routes:+$_routes }$_r"
+                done
+                if [ -n "$_routes" ]; then
+                    uci set "podkop.corp.user_subnet_list_type=text"
+                    uci set "podkop.corp.user_subnets_text=$_routes"
+                    uci commit podkop
+                fi
                 service podkop restart > /dev/null 2>&1
                 json_init
                 json_add_boolean "ok" 1
