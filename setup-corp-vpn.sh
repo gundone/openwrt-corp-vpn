@@ -90,9 +90,7 @@ ask() {
 ask_password() {
     local prompt="$1" answer
     printf "${BOLD}%s${NC}: " "$prompt" >&2
-    stty -echo < /dev/tty 2>/dev/null
-    read -r answer < /dev/tty
-    stty echo < /dev/tty 2>/dev/null
+    read -s -r answer
     printf "\n" >&2
     echo "$answer"
 }
