@@ -658,6 +658,8 @@ create_daily_script() {
 # Использование: corpvpn [connect|disconnect|status|servers|addhost|delhost|schedule|unschedule]
 #
 
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
 IFACE="corp_vpn"
 UCI_CONFIG="corpvpn"
 UCI_SECTION="main"
