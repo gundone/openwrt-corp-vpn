@@ -31,7 +31,7 @@ LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
 LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
 LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
 HOTPLUG_SCRIPT="/etc/hotplug.d/iface/99-corpvpn-no-retry"
-CORPVPN_VERSION="1.2.1"
+CORPVPN_VERSION="1.3.0"
 CORPVPN_REPO="gundone/corpvpn-for-podkop"
 
 # Собранные данные (заполняются в процессе)
@@ -482,16 +482,35 @@ case "$ACTION" in
                 service podkop restart > /dev/null 2>&1
             fi
         fi
+
+        # Apply MTU to VPN interface (prevents RDP/large packet freezes).
+        # VPN tunnel has overhead, so packets > MTU get dropped silently.
+        _mtu=$(uci -q get corpvpn.main.mtu)
+        if [ -n "$_mtu" ] && [ "$_mtu" -gt 0 ] 2>/dev/null; then
+            ip link set vpn-corp_vpn mtu "$_mtu" 2>/dev/null
+            # MSS clamping: tell TCP connections to use smaller segments
+            nft add chain inet fw4 corpvpn_mss '{ type filter hook forward priority mangle; }' 2>/dev/null
+            nft flush chain inet fw4 corpvpn_mss 2>/dev/null
+            nft add rule inet fw4 corpvpn_mss oifname "vpn-corp_vpn" tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
+            nft add rule inet fw4 corpvpn_mss iifname "vpn-corp_vpn" tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
+        fi
+
         # Clean up the flag — connection succeeded
         rm -f "$CONNECT_FLAG"
         ;;
     ifdown)
+        # Clean up MSS clamping rules
+        nft delete chain inet fw4 corpvpn_mss 2>/dev/null
+
         # If user initiated this connect (corpvpn connect/restart or LuCI),
         # the flag file exists — don't interfere with the reconnection.
         if [ -f "$CONNECT_FLAG" ]; then
             rm -f "$CONNECT_FLAG"
             exit 0
         fi
+
+        # If VPN was shut down by scheduled auto-disconnect, never reconnect
+        [ -f /tmp/.corpvpn_scheduled_off ] && { ifdown corp_vpn 2>/dev/null; exit 0; }
 
         # Prevent netifd auto-retry (unless auto_reconnect is enabled)
         _ar=$(uci -q get corpvpn.main.auto_reconnect)
@@ -722,6 +741,7 @@ create_uci_config() {
     done
 
     uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.auto_reconnect=0"
+    uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.mtu=1300"
     uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.version=$CORPVPN_VERSION"
     uci commit "$CORPVPN_UCI"
     ok "UCI-конфиг создан (v$CORPVPN_VERSION)"
@@ -913,6 +933,7 @@ do_connect() {
 
     printf "${BLUE}[i]${NC} Подключение к корпоративному VPN...\n"
     printf "${YELLOW}[!]${NC} Подтвердите 2FA на телефоне!\n"
+    rm -f /tmp/.corpvpn_scheduled_off
     ifup "$IFACE"
 
     # Ждём подключения (одна попытка, без ретраев)
@@ -1044,7 +1065,7 @@ do_schedule() {
     if [ -f /etc/crontabs/root ]; then
         sed -i "/$CRON_TAG/d" /etc/crontabs/root
     fi
-    echo "$minute $hour * * * /usr/bin/corpvpn disconnect  # $CRON_TAG" >> /etc/crontabs/root
+    echo "$minute $hour * * * touch /tmp/.corpvpn_scheduled_off; /usr/bin/corpvpn disconnect  # $CRON_TAG" >> /etc/crontabs/root
     /etc/init.d/cron restart 2>/dev/null
     printf "${GREEN}[+]${NC} Автоотключение: каждый день в %s\n" "$time"
 }
@@ -1244,6 +1265,7 @@ case "$1" in
                 json_add_string "server" "${_uri:-}"
                 _rc=$(ip route 2>/dev/null | grep -c "dev vpn-corp_vpn")
                 json_add_int "route_count" "${_rc:-0}"
+                json_add_string "time" "$(date +%H:%M)"
                 json_dump
                 ;;
             getRoutes)
@@ -1293,6 +1315,7 @@ case "$1" in
                     uci commit network
                 fi
                 touch /tmp/.corpvpn_user_connect
+                rm -f /tmp/.corpvpn_scheduled_off
                 ifup corp_vpn 2>/dev/null
                 json_init
                 json_add_boolean "ok" 1
@@ -1444,6 +1467,10 @@ return view.extend({
             srvEl.textContent = 'Сервер: ' + ((s && s.server) || 'N/A');
             if (rtEl) {
                 rtEl.textContent = (s && s.up && s.route_count) ? 'Маршрутов: ' + s.route_count : '';
+            var timeEl = document.getElementById('router-time');
+            if (timeEl && s && s.time) {
+                timeEl.textContent = s.time;
+            }
             }
         });
     },
@@ -1453,6 +1480,7 @@ return view.extend({
         var servers = uci.get('corpvpn', 'main', 'servers') || [];
         var disconnectTime = uci.get('corpvpn', 'main', 'disconnect_time') || '';
         var autoReconnect = uci.get('corpvpn', 'main', 'auto_reconnect') || '0';
+        var vpnMtu = uci.get('corpvpn', 'main', 'mtu') || '1300';
         var currentUri = uci.get('network', 'corp_vpn', 'uri') || '';
         var self = this;
 
@@ -1561,69 +1589,9 @@ return view.extend({
             ])
         ]);
 
-        /* ── Маршруты ── */
-        var routesContent = E('div', { id: 'routes-list' }, [
-            E('p', { style: 'color:#999' }, status.up ? 'Загрузка...' : 'VPN отключен')
-        ]);
-
-        var routesBox = E('div', { 'class': 'cbi-section' }, [
-            E('h3', {}, 'Split-include маршруты'),
-            E('p', { style: 'color:#666;margin-bottom:8px;font-size:90%' },
-                'Маршруты, которые VPN-сервер передаёт клиенту. Трафик к этим адресам идёт через VPN-туннель.'),
-            routesContent
-        ]);
-
-        if (status.up) {
-            callGetRoutes().then(function(data) {
-                var el = document.getElementById('routes-list');
-                if (!el || !data) return;
-                var routes = data.routes || [];
-                if (routes.length === 0) {
-                    dom.content(el, E('p', { style: 'color:#999' }, 'Нет маршрутов (full tunnel или сервер не передаёт split-include)'));
-                    return;
-                }
-                var items = routes.map(function(r) {
-                    return E('div', { style: 'font-family:monospace;padding:1px 0' }, r);
-                });
-                items.push(E('div', { style: 'margin-top:6px;color:#666' }, 'Всего: ' + routes.length));
-                dom.content(el, items);
-            });
-        }
-
-        /* ── Автоотключение ── */
-        var scheduleBox = E('div', { 'class': 'cbi-section' }, [
-            E('h3', {}, 'Автоотключение'),
-            E('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, [
-                E('label', {}, 'Время:'),
-                E('input', { id: 'disconnect-time', type: 'time', 'class': 'cbi-input-text', value: disconnectTime, style: 'width:130px' }),
-                E('button', {
-                    'class': 'cbi-button cbi-button-apply',
-                    click: ui.createHandlerFn(this, function() {
-                        var t = document.getElementById('disconnect-time').value;
-                        if (!t) return;
-                        return callSetSchedule(t).then(function() {
-                            uci.set('corpvpn', 'main', 'disconnect_time', t);
-                            ui.addNotification(null, E('p', 'Автоотключение: каждый день в ' + t), 'success');
-                        });
-                    })
-                }, 'Сохранить'),
-                E('button', {
-                    'class': 'cbi-button cbi-button-remove',
-                    click: ui.createHandlerFn(this, function() {
-                        return callRemoveSchedule().then(function() {
-                            uci.unset('corpvpn', 'main', 'disconnect_time');
-                            document.getElementById('disconnect-time').value = '';
-                            ui.addNotification(null, E('p', 'Автоотключение отменено'), 'success');
-                        });
-                    })
-                }, 'Отключить')
-            ]),
-            disconnectTime
-                ? E('p', { style: 'color:#4caf50;margin-top:6px' }, 'Активно: отключение каждый день в ' + disconnectTime)
-                : E('p', { style: 'color:#999;margin-top:6px' }, 'Не настроено')
-        ]);
-
         /* ── Настройки ── */
+        var scheduleEnabled = !!disconnectTime;
+
         var reconnectCheckbox = E('input', {
             type: 'checkbox',
             id: 'auto-reconnect',
@@ -1631,26 +1599,103 @@ return view.extend({
             change: ui.createHandlerFn(this, function(ev) {
                 var val = ev.target.checked ? '1' : '0';
                 uci.set('corpvpn', 'main', 'auto_reconnect', val);
-                return uci.save().then(function() { return uci.apply(true); }).then(function() {
-                    ui.addNotification(null, E('p',
-                        val === '1'
-                            ? 'Автоматический реконнект включён'
-                            : 'Автоматический реконнект выключен'),
-                        'success');
-                });
+                return uci.save().then(function() { return uci.apply(true); });
             })
         });
 
+        var mtuInput = E('input', {
+            type: 'number',
+            id: 'vpn-mtu',
+            'class': 'cbi-input-text',
+            value: vpnMtu,
+            min: '1000',
+            max: '1500',
+            style: 'width:80px',
+            change: ui.createHandlerFn(this, function(ev) {
+                var val = ev.target.value;
+                uci.set('corpvpn', 'main', 'mtu', val);
+                return uci.save().then(function() { return uci.apply(true); });
+            })
+        });
+
+        var schedTimeInput = E('input', {
+            id: 'disconnect-time',
+            type: 'text',
+            'class': 'cbi-input-text',
+            value: disconnectTime || '21:00',
+            placeholder: '21:00',
+            disabled: !scheduleEnabled ? '' : null,
+            style: 'width:80px;text-align:center',
+            change: ui.createHandlerFn(this, function(ev) {
+                var t = ev.target.value;
+                if (!/^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(t)) {
+                    ui.addNotification(null, E('p', 'Формат: HH:MM (00:00–23:59)'), 'warning');
+                    return;
+                }
+                if (document.getElementById('sched-enabled').checked) {
+                    return callSetSchedule(t);
+                }
+            })
+        });
+
+        var schedCheckbox = E('input', {
+            type: 'checkbox',
+            id: 'sched-enabled',
+            checked: scheduleEnabled ? '' : null,
+            change: ui.createHandlerFn(this, function(ev) {
+                var timeEl = document.getElementById('disconnect-time');
+                timeEl.disabled = !ev.target.checked;
+                if (ev.target.checked) {
+                    var t = timeEl.value || '21:00';
+                    timeEl.value = t;
+                    return callSetSchedule(t);
+                } else {
+                    return callRemoveSchedule();
+                }
+            })
+        });
+
+        var _lbl = 'min-width:160px;text-align:right;padding-top:4px;font-weight:bold';
+        var _hint = 'color:#666;margin:4px 0 0;font-size:90%';
+        var _row = 'display:flex;gap:12px;margin-bottom:14px';
+
         var settingsBox = E('div', { 'class': 'cbi-section' }, [
             E('h3', {}, 'Настройки'),
-            E('div', { style: 'display:flex;align-items:flex-start;gap:8px;margin-bottom:6px' }, [
-                reconnectCheckbox,
+            E('div', { style: _row }, [
+                E('label', { 'for': 'auto-reconnect', style: _lbl + ';cursor:pointer' }, 'Реконнект'),
                 E('div', {}, [
-                    E('label', { 'for': 'auto-reconnect', style: 'font-weight:bold;cursor:pointer' }, 'Автоматический реконнект'),
-                    E('p', { style: 'color:#666;margin:4px 0 0;font-size:90%' },
+                    reconnectCheckbox,
+                    E('p', { style: _hint },
                         'При обрыве соединения VPN переподключится автоматически. ' +
                         'Не включайте, если используется подтверждение через приложение (2FA push) — ' +
                         'иначе сервер будет завален повторными запросами авторизации.')
+                ])
+            ]),
+            E('div', { style: _row }, [
+                E('label', { 'for': 'vpn-mtu', style: _lbl }, 'MTU'),
+                E('div', {}, [
+                    mtuInput,
+                    E('p', { style: _hint },
+                        'Максимальный размер пакета для VPN-туннеля (по умолч. 1300). ' +
+                        'Если RDP или другие приложения зависают при подключённом VPN — уменьшите. ' +
+                        '0 — не менять.')
+                ])
+            ]),
+            E('div', { style: _row }, [
+                E('label', { 'for': 'sched-enabled', style: _lbl + ';cursor:pointer' }, 'Автоотключение'),
+                E('div', {}, [
+                    E('div', { style: 'display:flex;align-items:center;gap:8px' }, [
+                        schedCheckbox,
+                        schedTimeInput,
+                        E('span', { style: 'color:#999;font-size:90%' }, [
+                            'Сейчас на роутере: ',
+                            E('span', { id: 'router-time' }, status.time || '—')
+                        ])
+                    ]),
+                    E('p', { style: _hint },
+                        'VPN отключится автоматически каждый день в указанное время. ' +
+                        'Реконнект после автоотключения не сработает — нужно подключаться вручную. ' +
+                        'Часовой пояс роутера: System → System → General Settings → Timezone.')
                 ])
             ])
         ]);
@@ -1727,7 +1772,7 @@ return view.extend({
         ]);
 
         /* ══════════ Вкладки ══════════ */
-        var contentMain = E('div', {}, [statusBox, connBox, serversBox, routesBox, scheduleBox, settingsBox]);
+        var contentMain = E('div', {}, [statusBox, connBox, serversBox, settingsBox]);
         var contentDiag = E('div', { style: 'display:none' }, [versionBox, logsBox]);
 
         var tabMainBtn = E('li', { 'class': 'cbi-tab' }, E('a', { href: '#' }, 'Управление'));
