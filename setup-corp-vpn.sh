@@ -423,29 +423,51 @@ setup_interface() {
 }
 
 # ============================================================
-# Hotplug: запрет авто-реконнекта netifd
+# Hotplug: split DNS + запрет авто-реконнекта netifd
 # ============================================================
 install_hotplug_no_retry() {
-    info "Установка hotplug-скрипта (запрет авто-реконнекта)..."
+    info "Установка hotplug-скрипта (split DNS + запрет авто-реконнекта)..."
 
     mkdir -p "$(dirname "$HOTPLUG_SCRIPT")"
     cat > "$HOTPLUG_SCRIPT" << 'HOTPLUG_EOF'
 #!/bin/sh
-# Prevent netifd from auto-retrying corp VPN connection
-# unless auto_reconnect is explicitly enabled by the user.
-# Without this, failed auth (e.g. unanswered 2FA push) triggers
-# an infinite reconnect loop that floods the VPN server.
+# Corp VPN hotplug script:
+# 1. On ifup  — set up split DNS from VPN-provided configuration
+# 2. On ifdown — clean up split DNS + prevent auto-retry (unless enabled)
 
 [ "$INTERFACE" = "corp_vpn" ] || exit 0
-[ "$ACTION" = "ifdown" ] || exit 0
 
-# If auto-reconnect is enabled in settings — let netifd retry
-_ar=$(uci -q get corpvpn.main.auto_reconnect)
-[ "$_ar" = "1" ] && exit 0
+SPLITDNS_CONF="/tmp/dnsmasq.d/corpvpn-splitdns.conf"
+OC_DNS_FILE="/tmp/openconnect-dns.vpn-corp_vpn"
 
-# Interface went down (connection dropped or auth failed).
-# Tell netifd to stop — user can reconnect manually via 'corpvpn connect'.
-ifdown corp_vpn 2>/dev/null
+case "$ACTION" in
+    ifup)
+        # VPN connected — extract split DNS entries from vpnc-script output.
+        # The vpnc-script writes DNS info to /tmp/openconnect-dns.* (patched path).
+        # We pick only domain-specific lines (server=/domain/ip) for dnsmasq,
+        # discarding catch-all lines (server=ip) that would break Podkop.
+        if [ -f "$OC_DNS_FILE" ]; then
+            grep '^server=/' "$OC_DNS_FILE" > "$SPLITDNS_CONF" 2>/dev/null
+            if [ -s "$SPLITDNS_CONF" ]; then
+                /etc/init.d/dnsmasq restart 2>/dev/null
+            else
+                rm -f "$SPLITDNS_CONF"
+            fi
+        fi
+        ;;
+    ifdown)
+        # Clean up split DNS
+        if [ -f "$SPLITDNS_CONF" ]; then
+            rm -f "$SPLITDNS_CONF"
+            /etc/init.d/dnsmasq restart 2>/dev/null
+        fi
+
+        # Prevent netifd auto-retry (unless auto_reconnect is enabled)
+        _ar=$(uci -q get corpvpn.main.auto_reconnect)
+        [ "$_ar" = "1" ] && exit 0
+        ifdown corp_vpn 2>/dev/null
+        ;;
+esac
 HOTPLUG_EOF
     chmod +x "$HOTPLUG_SCRIPT"
     ok "Hotplug-скрипт установлен: $HOTPLUG_SCRIPT"
@@ -872,6 +894,12 @@ do_connect() {
             printf "${GREEN}[+]${NC} Подключен!\n"
             show_status
             sync_routes_to_podkop
+            # Показать split DNS статус (настраивается hotplug-скриптом)
+            if [ -f /tmp/dnsmasq.d/corpvpn-splitdns.conf ]; then
+                local dns_count
+                dns_count=$(wc -l < /tmp/dnsmasq.d/corpvpn-splitdns.conf)
+                printf "${BLUE}[i]${NC} Split DNS: %s доменов через корп. DNS\n" "$dns_count"
+            fi
             printf "${BLUE}[i]${NC} Перезапуск Podkop...\n"
             service podkop restart > /dev/null 2>&1
             sleep 2
@@ -903,6 +931,7 @@ do_connect() {
 do_disconnect() {
     printf "${BLUE}[i]${NC} Отключение VPN...\n"
     ifdown "$IFACE"
+    # Split DNS очищается hotplug-скриптом при ifdown
     sleep 1
     printf "${GREEN}[+]${NC} VPN отключен\n"
 }
@@ -1188,6 +1217,9 @@ case "$1" in
                 json_add_string "server" "${_uri:-}"
                 _rc=$(ip route 2>/dev/null | grep -c "dev vpn-corp_vpn")
                 json_add_int "route_count" "${_rc:-0}"
+                _dc=0
+                [ -f /tmp/dnsmasq.d/corpvpn-splitdns.conf ] && _dc=$(wc -l < /tmp/dnsmasq.d/corpvpn-splitdns.conf)
+                json_add_int "dns_count" "${_dc:-0}"
                 json_dump
                 ;;
             getRoutes)
@@ -1378,6 +1410,7 @@ return view.extend({
             var ipEl = document.getElementById('vpn-ip');
             var srvEl = document.getElementById('vpn-srv');
             var rtEl = document.getElementById('vpn-routes');
+            var dnsEl = document.getElementById('vpn-dns');
             if (!dot) return;
             dot.style.background = statusColor(s);
             txt.textContent = statusText(s);
@@ -1385,6 +1418,9 @@ return view.extend({
             srvEl.textContent = 'Сервер: ' + ((s && s.server) || 'N/A');
             if (rtEl) {
                 rtEl.textContent = (s && s.up && s.route_count) ? 'Маршрутов: ' + s.route_count : '';
+            }
+            if (dnsEl) {
+                dnsEl.textContent = (s && s.up && s.dns_count) ? 'Split DNS: ' + s.dns_count + ' доменов' : '';
             }
         });
     },
@@ -1409,7 +1445,8 @@ return view.extend({
                 ]),
                 E('div', { id: 'vpn-ip' }, status.up ? 'IP: ' + (status.ip || 'N/A') : ''),
                 E('div', { id: 'vpn-srv' }, 'Сервер: ' + (status.server || 'N/A')),
-                E('div', { id: 'vpn-routes' }, (status.up && status.route_count) ? 'Маршрутов: ' + status.route_count : '')
+                E('div', { id: 'vpn-routes' }, (status.up && status.route_count) ? 'Маршрутов: ' + status.route_count : ''),
+                E('div', { id: 'vpn-dns' }, (status.up && status.dns_count) ? 'Split DNS: ' + status.dns_count + ' доменов' : '')
             ])
         ]);
 
